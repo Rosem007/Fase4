@@ -1,0 +1,142 @@
+# === Spark + Kafka: análisis y visualización en tiempo real ===
+from pyspark.sql import SparkSession
+from pyspark.sql.functions import (
+    from_json, col, window, count, avg, min as smin, max as smax,
+    stddev, expr, when
+)
+from pyspark.sql.types import StructType, StructField, IntegerType, FloatType, TimestampType
+import time
+
+# 1) Sesión de Spark
+spark = SparkSession.builder \
+    .appName("KafkaSparkStreaming-Enhanced") \
+    .getOrCreate()
+spark.sparkContext.setLogLevel("WARN")
+
+# 2) Esquema esperado en el JSON del campo "value" de Kafka
+schema = StructType([
+    StructField("sensor_id", IntegerType()),
+    StructField("temperature", FloatType()),
+    StructField("humidity", FloatType()),
+    StructField("timestamp", TimestampType())   # ISO8601 o epoch que hayas parseado en el productor
+])
+
+# 3) Fuente: Kafka (topic: sensor_data)
+raw = spark.readStream.format("kafka") \
+    .option("kafka.bootstrap.servers", "localhost:9092") \
+    .option("subscribe", "sensor_data") \
+    .option("startingOffsets", "latest") \
+    .load()
+
+# 4) Parseo del JSON y limpieza básica
+events = raw.select(
+    from_json(col("value").cast("string"), schema).alias("data")
+).select("data.*") \
+ .withWatermark("timestamp", "2 minutes")  # tolerancia a llegadas tardías
+
+# 5) Features y reglas simples (ej. anomalías)
+#    - Anomalía si temp > 50°C, temp < -20°C, humedad fuera de [0,100] o NaN
+events_enriched = events.select(
+    "*",
+    when( (col("temperature") > 50) | (col("temperature") < -20) |
+          (col("humidity") < 0) | (col("humidity") > 100) |
+          col("temperature").isNull() | col("humidity").isNull(),
+         expr("true")).otherwise(expr("false")).alias("is_anomaly")
+)
+
+# 6) Agregaciones por ventana de 1 minuto y por sensor
+stats_1m = events_enriched.groupBy(
+    window(col("timestamp"), "1 minute"),
+    col("sensor_id")
+).agg(
+    count("*").alias("events_count"),
+    avg("temperature").alias("temp_avg"),
+    smin("temperature").alias("temp_min"),
+    smax("temperature").alias("temp_max"),
+    stddev("temperature").alias("temp_std"),
+    avg("humidity").alias("hum_avg"),
+    smin("humidity").alias("hum_min"),
+    smax("humidity").alias("hum_max"),
+    stddev("humidity").alias("hum_std")
+)
+
+# 7) Tasa de eventos por minuto (global)
+rate_1m = events_enriched.groupBy(
+    window(col("timestamp"), "1 minute")
+).agg(
+    count("*").alias("events_per_minute"),
+    count(when(col("is_anomaly") == True, True)).alias("anomalies_per_minute")
+)
+
+# 8) Visualización en tiempo real (A): consola
+q_stats_console = stats_1m.writeStream \
+    .outputMode("complete") \
+    .format("console") \
+    .option("truncate", "false") \
+    .option("numRows", 50) \
+    .queryName("stats_console") \
+    .start()
+
+q_rate_console = rate_1m.writeStream \
+    .outputMode("complete") \
+    .format("console") \
+    .option("truncate", "false") \
+    .queryName("rate_console") \
+    .start()
+
+# 9) Visualización en tiempo real (B): tabla en memoria para consultar desde el driver
+#    Tip: en notebooks o scripts, puedes hacer consultas SQL periódicas.
+q_stats_memory = stats_1m.writeStream \
+    .outputMode("complete") \
+    .format("memory") \
+    .queryName("stats_1m") \
+    .start()
+
+q_rate_memory = rate_1m.writeStream \
+    .outputMode("complete") \
+    .format("memory") \
+    .queryName("rate_1m") \
+    .start()
+
+# 10) (Opcional) Flujo de alertas: solo anomalías, de vuelta a otro tópico Kafka
+# anomalies = events_enriched.filter(col("is_anomaly") == True) \
+#     .selectExpr("CAST(sensor_id AS STRING) AS key",
+#                 "to_json(struct(*)) AS value")
+# q_alerts = anomalies.writeStream \
+#     .format("kafka") \
+#     .option("kafka.bootstrap.servers", "localhost:9092") \
+#     .option("topic", "sensor_alerts") \
+#     .option("checkpointLocation", "/tmp/checkpoints/sensor_alerts") \
+#     .start()
+
+# 11) Mini “dashboard” textual: refresca cada 10 s top sensores por varianza
+try:
+    while True:
+        time.sleep(10)
+        print("\n===== TOP sensores por variabilidad de temperatura (última ventana) =====")
+        spark.sql("""
+            SELECT window.start AS win_start, window.end AS win_end, sensor_id,
+                   events_count, ROUND(temp_avg,2) AS temp_avg,
+                   ROUND(temp_std,2) AS temp_std,
+                   ROUND(hum_avg,2)  AS hum_avg
+            FROM stats_1m
+            ORDER BY temp_std DESC NULLS LAST, events_count DESC
+            LIMIT 10
+        """).show(truncate=False)
+
+        print("===== Tasa de eventos por minuto (global) =====")
+        spark.sql("""
+            SELECT window.start AS win_start, window.end AS win_end,
+                   events_per_minute, anomalies_per_minute
+            FROM rate_1m
+            ORDER BY win_start DESC
+            LIMIT 5
+        """).show(truncate=False)
+
+except KeyboardInterrupt:
+    pass
+
+# 12) Espera de terminación (por si no usas el “dashboard” de arriba)
+q_stats_console.awaitTermination()
+q_rate_console.awaitTermination()
+# q_alerts.awaitTermination()  # si activas las alertas
