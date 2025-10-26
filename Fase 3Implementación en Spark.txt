@@ -1,0 +1,171 @@
+ TAREA 3 - Procesamiento en Batch con Spark
+# Requisitos:
+# 1) Cargar dataset desde la fuente original (HDFS)
+# 2) Limpiar / transformar + EDA (DataFrames y mini ejemplo RDD)
+# 3) Almacenar resultados procesados en HDFS
+# ===============================================
+
+from pyspark.sql import SparkSession, functions as F, types as T
+
+# ---------- 0) Sesión Spark ----------
+spark = SparkSession.builder.appName("Tarea3_Batch").getOrCreate()
+spark.sparkContext.setLogLevel("WARN")
+
+# ---------- 1) Carga del conjunto de datos ----------
+INPUT_PATH = "hdfs://localhost:9000/Tarea3/rows.csv"
+
+# Salidas (usa tu home en HDFS para evitar AccessControlException)
+OUT_BASE = "hdfs://localhost:9000/user/vboxuser/Tarea3/output_batch"
+OUT_CLEAN_PARQUET = f"{OUT_BASE}/clean_parquet"
+OUT_EDA_NIVEL_CSV = f"{OUT_BASE}/eda_nivel_csv"
+OUT_EDA_HAB_CSV   = f"{OUT_BASE}/eda_habilitado_csv"
+OUT_TOP3_PARQUET  = f"{OUT_BASE}/ips_top3_parquet"
+OUT_ORD_PARQUET   = f"{OUT_BASE}/ips_ordenadas_parquet"
+
+df = (
+    spark.read.format("csv")
+    .option("header", "true")
+    .option("inferSchema", "true")   # infiere tipos de columnas
+    .load(INPUT_PATH)
+)
+
+print("\n📘 Esquema inicial:")
+df.printSchema()
+
+print("\n📊 Primeras 10 filas:")
+df.show(10, truncate=False)
+
+# ---------- 2) Limpieza y Transformación ----------
+# Normaliza textos, castea tipos y convierte fechas (YYYYMMDD -> date)
+# Asegura enteros en 'nivel' (algunos vienen nulos)
+df2 = df.withColumn("nivel", F.col("nivel").cast("int"))
+
+# Normaliza habilitado a mayúsculas
+df2 = df2.withColumn("habilitado", F.upper(F.col("habilitado")))
+
+# Convierte fechas en entero YYYYMMDD a date
+def yyyymmdd_to_date(col):
+    # castea a string, rellena a 8, y convierte con formato
+    return F.to_date(F.lpad(F.col(col).cast("string"), 8, "0"), "yyyyMMdd")
+
+for c in ["fecha_radicacion", "fecha_vencimiento", "fecha_cierre"]:
+    df2 = df2.withColumn(c + "_date", yyyymmdd_to_date(c))
+
+# Elimina duplicados y filas sin datos críticos
+df2 = df2.dropDuplicates()
+df2 = df2.dropna(subset=["nombre_prestador", "habilitado"])  # nivel puede faltar; no filtramos aún
+
+print("\n📘 Esquema después de limpieza:")
+df2.printSchema()
+
+# ---------- 3) EDA (DataFrames) ----------
+print("\n📈 Estadísticas descriptivas (nivel):")
+df2.describe(["nivel"]).show()
+
+print("\n🔢 Distribución por niveles de atención:")
+eda_nivel = df2.groupBy("nivel").count().orderBy("nivel")
+eda_nivel.show()
+
+print("\n🏥 Conteo por estado de habilitación:")
+eda_hab = df2.groupBy("habilitado").count().orderBy(F.desc("count"))
+eda_hab.show()
+
+# Filtro de interés: IPS habilitadas y nivel >= 3
+print("\n🔎 IPS habilitadas con nivel >= 3:")
+ips_filtradas = (
+    df2.filter((F.col("habilitado") == "SI") & (F.col("nivel") >= 3))
+       .select(
+           "nombre_prestador", "depa_nombre", "muni_nombre",
+           "nivel", "fecha_vencimiento_date"
+ )
+       .withColumnRenamed("fecha_vencimiento_date", "fecha_vencimiento")
+)
+ips_filtradas.show(10, truncate=False)
+
+# Orden por fecha de vencimiento (más recientes primero)
+print("\n📅 IPS ordenadas por fecha de vencimiento (desc):")
+ips_ordenadas = ips_filtradas.orderBy(F.col("fecha_vencimiento").desc_nulls_last())
+ips_ordenadas.show(10, truncate=False)
+
+# Top 3 por departamento según fecha de vencimiento más reciente
+w_dep = (
+    F.row_number()
+    .over(
+        Window.partitionBy("depa_nombre")
+              .orderBy(F.col("fecha_vencimiento").desc_nulls_last())
+    )
+)
+from pyspark.sql import Window
+ips_top3_dep = (
+    ips_filtradas
+    .withColumn("rn", w_dep)
+    .filter(F.col("rn") <= 3)
+    .drop("rn")
+)
+print("\n🥇 Top 3 IPS por departamento (por fecha de vencimiento):")
+ips_top3_dep.show(30, truncate=False)
+
+# ---------- 4) Mini EDA con RDD (opcional, para cubrir 'RDDs o DataFrames') ----------
+print("\n🧱 Ejemplo RDD: número de municipios distintos por departamento (método RDD)")
+rdd_dep_muni = (
+    df2.select("depa_nombre", "muni_nombre")
+       .dropna()
+       .rdd
+       .map(lambda r: ((r["depa_nombre"], r["muni_nombre"]), 1))
+       .reduceByKey(lambda a, b: a + b)
+       .map(lambda kv: (kv[0][0], 1))          # (depa, 1) por municipio único
+       .reduceByKey(lambda a, b: a + b)        # (depa, num_municipios)
+	   
+	)
+df_dep_muni = rdd_dep_muni.toDF(["depa_nombre", "municipios_unicos"])
+df_dep_muni.orderBy(F.desc("municipios_unicos")).show(20, truncate=False)
+
+# ---------- 5) Almacenamiento de resultados ----------
+# Nota: Spark creará las carpetas si tienes permisos en /user/vboxuser.
+# Si no existen, crea la base una sola vez:
+#   hdfs dfs -mkdir -p /user/vboxuser/Tarea3/output_batch
+#   sudo -u hdfs hdfs dfs -chown -R vboxuser:hadoop /user/vboxuser
+
+print(f"\n💾 Guardando dataset limpio en Parquet: {OUT_CLEAN_PARQUET}")
+(
+    df2.coalesce(1)
+       .write.mode("overwrite")
+       .option("compression", "snappy")
+       .parquet(OUT_CLEAN_PARQUET)
+)
+
+print(f"💾 Guardando EDA por nivel (CSV): {OUT_EDA_NIVEL_CSV}")
+(
+    eda_nivel.coalesce(1)
+             .write.mode("overwrite")
+             .option("header", "true")
+             .csv(OUT_EDA_NIVEL_CSV)
+)
+
+print(f"💾 Guardando EDA por habilitado (CSV): {OUT_EDA_HAB_CSV}")
+(
+    eda_hab.coalesce(1)
+           .write.mode("overwrite")
+           .option("header", "true")
+           .csv(OUT_EDA_HAB_CSV)
+)
+
+print(f"💾 Guardando Top3 por departamento (Parquet): {OUT_TOP3_PARQUET}")
+(
+    ips_top3_dep.coalesce(1)
+                .write.mode("overwrite")
+
+	                .parquet(OUT_TOP3_PARQUET)
+)
+
+print(f"💾 Guardando IPS ordenadas por vencimiento (Parquet): {OUT_ORD_PARQUET}")
+(
+    ips_ordenadas.coalesce(1)
+                 .write.mode("overwrite")
+                 .option("compression", "snappy")
+                 .parquet(OUT_ORD_PARQUET)
+)
+
+print("\n✅ Proceso batch completado con éxito.")
+spark.stop()
+			
